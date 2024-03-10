@@ -134,9 +134,10 @@ class PremiseRetriever(pl.LightningModule):
         all_premise_embs = torch.cat([pos_premise_emb, *neg_premise_embs], dim=0)
 
         # Cosine similarities for unit-norm vectors are just inner products.
+        # tensor.t() ，用于将一个张量的维度 transpose（转置）
         similarity = torch.mm(context_emb, all_premise_embs.t())
         assert -1 <= similarity.min() <= similarity.max() <= 1
-        loss = F.mse_loss(similarity, label)
+        loss = F.mse_loss(similarity, label)  # 均方误差 (Mean Squared Error, MSE)
         return loss
 
     ############
