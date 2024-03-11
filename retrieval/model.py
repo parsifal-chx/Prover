@@ -49,7 +49,7 @@ class PremiseRetriever(pl.LightningModule):
         self.max_seq_len = max_seq_len
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.encoder = T5EncoderModel.from_pretrained(model_name)
-        self.embeddings_staled = True
+        self.embeddings_staled = True  # 嵌入层是否是当前的语料库的向量
 
     @classmethod
     def load(cls, ckpt_path: str, device, freeze: bool) -> "PremiseRetriever":
@@ -110,7 +110,7 @@ class PremiseRetriever(pl.LightningModule):
         ) / lens.unsqueeze(1)
 
         # Normalize the feature vector to have unit norm.
-        # 规范化，使每个向量都具有单位范数（即向量的长度为 1）
+        # 规范化，使每个向量都具有单位范数（即向量的长度为 1），这样在算余弦相似度时就不用除向量的模长
         return F.normalize(features, dim=1)
 
     def forward(
@@ -147,8 +147,8 @@ class PremiseRetriever(pl.LightningModule):
     # 在拟合一开始就调用
     def on_fit_start(self) -> None:
         if self.logger is not None:
-            self.logger.log_hyperparams(self.hparams)
-            logger.info(f"Logging to {self.trainer.log_dir}")
+            self.logger.log_hyperparams(self.hparams)  # 记录了模型的超参数
+            logger.info(f"Logging to {self.trainer.log_dir}")  # 记录了一个信息级别的日志，显示日志文件被保存的位置
 
         self.corpus = self.trainer.datamodule.corpus
         self.corpus_embeddings = None
@@ -178,7 +178,7 @@ class PremiseRetriever(pl.LightningModule):
     # 在每个批次结束时调用
     def on_train_batch_end(self, outputs, batch, _) -> None:
         """Mark the embeddings as staled after a training batch."""
-        self.embeddings_staled = True
+        self.embeddings_staled = True  # 表示当前的语料库与嵌入层的向量不符合，需要更新
 
     # 优化器定义，返回一个优化器，或数个优化器，或两个List（优化器，Scheduler）
     def configure_optimizers(self) -> Dict[str, Any]:
@@ -193,10 +193,11 @@ class PremiseRetriever(pl.LightningModule):
     @torch.no_grad()
     def reindex_corpus(self, batch_size: int) -> None:
         """Re-index the retrieval corpus using the up-to-date encoder."""
-        if not self.embeddings_staled:
+        if not self.embeddings_staled:  # 嵌入层与语料库匹配
             return
         logger.info("Re-indexing the retrieval corpus")
 
+        # corpus_embeddings [all_premises,embedding_size]
         self.corpus_embeddings = torch.zeros(
             len(self.corpus.all_premises),
             self.embedding_size,
@@ -205,21 +206,21 @@ class PremiseRetriever(pl.LightningModule):
         )
 
         for i in tqdm(range(0, len(self.corpus), batch_size)):
-            batch_premises = self.corpus.all_premises[i: i + batch_size]
-            tokenized_premises = self.tokenizer(
+            batch_premises = self.corpus.all_premises[i: i + batch_size]  # 获取当前批次的所有前提
+            tokenized_premises = self.tokenizer(  # 使用tokenized转化为向量
                 [p.serialize() for p in batch_premises],
                 padding="longest",
                 max_length=self.max_seq_len,
                 truncation=True,
                 return_tensors="pt",
             ).to(self.device)
-            self.corpus_embeddings[i: i + batch_size] = self._encode(
+            self.corpus_embeddings[i: i + batch_size] = self._encode(  # 编码
                 tokenized_premises.input_ids, tokenized_premises.attention_mask
             )
 
         self.embeddings_staled = False
 
-    # 在验证开始前
+    # 在验证开始前，先判断向量与预料库是否匹配
     def on_validation_start(self) -> None:
         self.reindex_corpus(self.trainer.datamodule.eval_batch_size)
 
@@ -230,7 +231,7 @@ class PremiseRetriever(pl.LightningModule):
         # Retrieval.
         context_emb = self._encode(batch["context_ids"], batch["context_mask"])
         assert not self.embeddings_staled
-        retrieved_premises, _ = self.corpus.get_nearest_premises(
+        retrieved_premises, _ = self.corpus.get_nearest_premises(  # 获取前k个相似的前提
             self.corpus_embeddings,
             batch["context"],
             context_emb,
@@ -239,24 +240,24 @@ class PremiseRetriever(pl.LightningModule):
 
         # Evaluation & logging.
         recall = [[] for _ in range(self.num_retrieved)]
-        MRR = []
+        MRR = []  # MRR将记录平均倒数排名的数值
         num_with_premises = 0
-        tb = self.logger.experiment
+        tb = self.logger.experiment  # tb是TensorBoard日志记录器的简写
 
         for i, (all_pos_premises, premises) in enumerate(
                 zip_strict(batch["all_pos_premises"], retrieved_premises)
         ):
-            # Only log the first example in the batch.
+            # Only log the first example in the batch. 仅记录批次中的第一个例子
             if i == 0:
-                msg_gt = "\n\n".join([p.serialize() for p in all_pos_premises])
+                msg_gt = "\n\n".join([p.serialize() for p in all_pos_premises])  # 正面的例子
                 msg_retrieved = "\n\n".join(
-                    [f"{j}. {p.serialize()}" for j, p in enumerate(premises)]
+                    [f"{j}. {p.serialize()}" for j, p in enumerate(premises)]  # 检索到的例子
                 )
-                TP = len(set(premises).intersection(all_pos_premises))
-                if len(all_pos_premises) == 0:
-                    r = math.nan
+                TP = len(set(premises).intersection(all_pos_premises))  # TP（检索的正例）是检索到的前提和所有正面前提集合的交集的数量
+                if len(all_pos_premises) == 0:  # r是该样本的召回率
+                    r = math.nan  # r被设为NaN（非数字）
                 else:
-                    r = float(TP) / len(all_pos_premises)
+                    r = float(TP) / len(all_pos_premises)  # 检索的正例数量除以所有正面前提的数量
                 msg = f"Recall@{self.num_retrieved}: {r}\n\nGround truth:\n\n```\n{msg_gt}\n```\n\nRetrieved:\n\n```\n{msg_retrieved}\n```"
                 tb.add_text(f"premises_val", msg, self.global_step)
 
@@ -270,10 +271,11 @@ class PremiseRetriever(pl.LightningModule):
             for j in range(self.num_retrieved):
                 TP = len(all_pos_premises.intersection(premises[: (j + 1)]))
                 recall[j].append(float(TP) / len(all_pos_premises))
+                # 排名为j的前提是真正的正例，并且是首次找到的匹配，则在MRR中添加该排名的倒数，并将first_match_found设置为True
                 if premises[j] in all_pos_premises and not first_match_found:
                     MRR.append(1.0 / (j + 1))
                     first_match_found = True
-            if not first_match_found:
+            if not first_match_found:  # 没有发现任何真正的正例，则在MRR列表中添加0.0
                 MRR.append(0.0)
 
         recall = [100 * np.mean(_) for _ in recall]

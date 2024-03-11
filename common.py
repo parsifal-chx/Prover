@@ -91,7 +91,7 @@ class Premise:
 
     def serialize(self) -> str:
         """Serialize the premise into a string for Transformers."""
-        annot_full_name = f"{MARK_START_SYMBOL}{self.full_name}{MARK_END_SYMBOL}"
+        annot_full_name = f"{MARK_START_SYMBOL}{self.full_name}{MARK_END_SYMBOL}"  # 添加<a>标志
         code = self.code.replace(f"_root_.{self.full_name}", annot_full_name)
         fields = self.full_name.split(".")
 
@@ -295,21 +295,22 @@ class Corpus:
                or self.transitive_dep_graph.has_edge(path, p.path)
         ]
 
+    # 获取最相近的前提
     def get_nearest_premises(
             self,
-            premise_embeddings: torch.FloatTensor,
-            batch_context: List[Context],
-            batch_context_emb: torch.Tensor,
-            k: int,
+            premise_embeddings: torch.FloatTensor,  # 查询前提
+            batch_context: List[Context],  # 查询前提的上下文，用于限制前提访问
+            batch_context_emb: torch.Tensor,  # 从中寻找相似度高的前提
+            k: int,  # 前k个相近的
     ) -> Tuple[List[List[Premise]], List[List[float]]]:
         """Perform a batch of nearest neighbour search."""
-        similarities = batch_context_emb @ premise_embeddings.t()
+        similarities = batch_context_emb @ premise_embeddings.t()  # @表示矩阵乘法，premise_embeddings.t()是前提嵌入向量的转置
         idxs_batch = similarities.argsort(dim=1, descending=True).tolist()
         results = [[] for _ in batch_context]
         scores = [[] for _ in batch_context]
 
         for j, (ctx, idxs) in enumerate(zip(batch_context, idxs_batch)):
-            accessible_premises = self.get_accessible_premises(
+            accessible_premises = self.get_accessible_premises(  # 提取当前上下文可访问的前提列表
                 ctx.path, ctx.theorem_pos
             )
             for i in idxs:
@@ -410,14 +411,27 @@ def format_augmented_state(
     aug_s += s
     return aug_s
 
-
+# 用于创建一个优化器
 def get_optimizers(
         parameters, trainer: pl.Trainer, lr: float, warmup_steps: int
 ) -> Dict[str, Any]:
-    """Return an AdamW optimizer with cosine warmup learning rate schedule."""
+    """
+    Return an AdamW optimizer with cosine warmup learning rate schedule.
+
+    DeepSpeedCPUAdam: 这是一种专为Microsoft DeepSpeed库设计的优化器。DeepSpeed是一个用于深度学习优化的库，它提供了一系列提升大规模训练性能的工具。D
+    eepSpeedCPUAdam优化器是为了在CPU上进行模型参数的优化，并且在使用Zero Redundancy Optimizer（零冗余优化器）时，它支持内存优化，可以将部分参数或优化状态卸载到CPU来节省GPU内存。
+
+    FusedAdam: 同样是DeepSpeed库的一部分，FusedAdam是一个高性能的优化器，它将某些计算步骤融合起来，以减少计算时间和提高效率。
+    这种融合操作通常是在GPU上执行的，利用更高效的内存访问模式和计算操作。
+
+    AdamW: 这是一个标准的优化器，它在Adam算法的基础上加入了权重衰减。
+    AdamW优化器更加注重正则化，有助于防止过拟合。这种优化器不针对特定的硬件进行优化，而是可以在大多数标准的训练场景中使用。
+
+    """
     strategy = trainer.strategy
 
-    if isinstance(strategy, DeepSpeedStrategy):
+    if isinstance(strategy, DeepSpeedStrategy):  # 检查策略类型是否为DeepSpeedStrategy
+        # 如果配置中包含'offload_optimizer'选项，则使用DeepSpeedCPUAdam优化器
         if "offload_optimizer" in strategy.config["zero_optimization"]:
             logger.info("Optimizing with DeepSpeedCPUAdam")
             optimizer = DeepSpeedCPUAdam(parameters, lr=lr, adamw_mode=True)
@@ -428,6 +442,7 @@ def get_optimizers(
         logger.info("Optimizing with AdamW")
         optimizer = torch.optim.AdamW(parameters, lr=lr)
 
+    # 计算最大步数，可以是直接设置的max_steps，如果没有设置，则根据最大训练轮数、训练数据加载器的长度和梯度累积批次数动态计算
     if trainer.max_steps != -1:
         max_steps = trainer.max_steps
     else:
@@ -438,6 +453,16 @@ def get_optimizers(
                 // trainer.accumulate_grad_batches
         )
 
+    # 创建学习率调度器，使用余弦预热调度
+    """
+    学习率调度器，使用余弦预热调度意味着：
+
+    预热（Warmup）: 在训练开始的若干步内，学习率会从0或一个较小的值逐渐增加到初始设定的学习率。
+    这个过程叫做预热，目的是在训练初期阶段慢慢提升学习率，避免模型在开始训练时由于过高学习率导致的不稳定。
+    
+    余弦调度（Cosine Scheduling）: 学习率在预热后会按照余弦函数的形状逐渐下降。
+    具体来说，当预热结束后，学习率会开始以余弦曲线的形式缓慢降低到接近零的值，这个过程会持续到训练结束。这种方法可以在训练的后期阶段使学习率平滑地减小，有助于模型收敛到更好的性能。
+    """
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
